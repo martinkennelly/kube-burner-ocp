@@ -163,6 +163,8 @@ type raLatency struct {
 	exportDoneCh chan struct{}
 	// channel to notify closure of import workers
 	importDoneCh chan struct{}
+	// channel used by import workers to report verification failures
+	importErrCh chan error
 	// channel wused between main thread and import threads. Main thread notifies import threads which routes to generate.
 	routeImportChan chan routeImport
 	wg              sync.WaitGroup
@@ -410,17 +412,18 @@ func pingAddress(srcIP, destIP string, pingerTimeoutMsec int) error {
 During the import scenario, ping one CUDN pod to validate that the CUDN's gateway router imported the external route.
 
 Each ping will be attempted pingAttempts times with a sleep between attempts.
-Returns latency in ms when the ping succeeds, or -1 on failure.
+Returns latency in ms and nil when the ping succeeds, or -1 and the last error on failure.
 */
-func pingOneCudn(destPod, srcAddr string) float64 {
+func pingOneCudn(destPod, srcAddr string) (float64, error) {
 	importTimestamp := time.Now().UTC()
+	var pingErr error
 	for range pingAttempts {
-		if err := pingAddress(srcAddr, destPod, importPingerTimeoutMsec); err == nil {
-			return float64(time.Since(importTimestamp).Milliseconds())
+		if pingErr = pingAddress(srcAddr, destPod, importPingerTimeoutMsec); pingErr == nil {
+			return float64(time.Since(importTimestamp).Milliseconds()), nil
 		}
 		time.Sleep(importWaitBeforePingRetryMsec * time.Millisecond)
 	}
-	return -1
+	return -1, pingErr
 }
 
 /*
@@ -459,7 +462,12 @@ func (r *raLatency) importWorker() {
 			if err != nil {
 				log.Errorf("Failed to add IP address: %v", err)
 			}
-			importLatency := pingOneCudn(mc.pod, ipAddr.String())
+			importLatency, err := pingOneCudn(mc.pod, ipAddr.String())
+			if err != nil {
+				log.Errorf("Failed to verify import route %s: %v", mc.addr, err)
+				r.importErrCh <- fmt.Errorf("verify import route %s: %w", mc.addr, err)
+				return
+			}
 			log.Debugf("Import route %s ping latency: %v ms", mc.addr, importLatency)
 
 			m := raMetric{
@@ -774,6 +782,31 @@ func (r *raLatency) waitForSceanrioCompletion(desiredCount uint64, maxTimeout ti
 	}
 }
 
+func (r *raLatency) waitForImportScenarioCompletion(desiredCount uint64, maxTimeout time.Duration) error {
+	var count uint64
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	timeoutTimer := time.NewTimer(maxTimeout)
+	defer timeoutTimer.Stop()
+
+	for {
+		select {
+		case err := <-r.importErrCh:
+			return fmt.Errorf("import scenario failed: %w", err)
+		case <-ticker.C:
+			count = atomic.LoadUint64(&r.verifiedImportRouteCount)
+			log.Debugf("count %v , desiredCount %v", count, desiredCount)
+			if count >= desiredCount {
+				log.Debugf("Desired count reached, signaling stop.")
+				return nil
+			}
+		case <-timeoutTimer.C:
+			return fmt.Errorf("import scenario timed out after %s: verified %d of %d routes", maxTimeout, count, desiredCount)
+		}
+	}
+}
+
 // Stop stops raLatency measurement
 func (r *raLatency) Stop() error {
 	var err error
@@ -790,12 +823,13 @@ func (r *raLatency) Stop() error {
 
 	// start import scenario
 	r.importDoneCh = make(chan struct{})
+	r.importErrCh = make(chan error, importWorkerCount)
 	if err = r.startImportScenario(); err != nil {
 		return err
 	}
 	// wait for import scenario completion
 	desiredCount = uint64(importRoutesCount)
-	r.waitForSceanrioCompletion(desiredCount, importScenarioMaxTimeout, "import")
+	importErr := r.waitForImportScenarioCompletion(desiredCount, importScenarioMaxTimeout)
 	// stop import workers
 	close(r.importDoneCh)
 
@@ -805,8 +839,11 @@ func (r *raLatency) Stop() error {
 	for i := range numDummyIfaces {
 		err = r.deleteDummyInterface(i)
 		if err != nil {
-			log.Error("Error deleting dummy interfaces: %w", err)
+			log.Errorf("Error deleting dummy interface %d: %v", i, err)
 		}
+	}
+	if importErr != nil {
+		return importErr
 	}
 	return r.StopMeasurement(r.normalizeMetrics, r.getLatency)
 }
