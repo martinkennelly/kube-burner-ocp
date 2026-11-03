@@ -134,7 +134,10 @@ type cudnPods struct {
 
 // type holds route detection and cudn pod's ping timestamp
 type netlinkRoutes struct {
-	// linux doesn't allow adding duplicate routes, so routeTimestamp is not a slice
+	// mu serializes workers handling duplicate RTM_NEWROUTE notifications for
+	// the same CUDN. It protects the mutable route state, particularly
+	// pingTimestamp, from being overwritten by concurrent verification work.
+	mu sync.Mutex
 	// measure timestamp when a route (belonging to cudn's subnet) detected by the kernel
 	routeTimestamp time.Time
 	// cudn subnet is exported as route. KB detected this route in its host. Now KB pings one corresponding cudn pod and stores the success timestamp.
@@ -151,6 +154,7 @@ type raLatency struct {
 	cudnConnTimestamp sync.Map
 	// how many routes verified during export scenario, helpful for closing the export threads
 	verifiedExportRouteCount uint64
+	verifiedExportRoutes     sync.Map
 	// how many routes verified during impport scenario, helpful for closing the import threads
 	verifiedImportRouteCount uint64
 	// netlink channel we open with the kernel for route monitoring
@@ -492,13 +496,13 @@ func (r *raLatency) exportWorker() {
 			if update.Type == unix.RTM_NEWROUTE {
 				cudnpods, exists := r.cudnSubnet[update.Dst.String()]
 				if exists {
-					// linux doesn't allow adding duplicate routes, so new routeTimestamp should be added
 					log.Debugf("Netlink route: %s received for udn: %s at: %v", update.Dst.String(), cudnpods.cudn, time.Now().UTC())
-					val, _ := r.cudnConnTimestamp.LoadOrStore(cudnpods.cudn, netlinkRoutes{
+					val, _ := r.cudnConnTimestamp.LoadOrStore(cudnpods.cudn, &netlinkRoutes{
 						routeTimestamp: time.Now().UTC(),
 					})
-					if nlRouteVal, ok := val.(netlinkRoutes); ok {
-						if len(cudnpods.pods) > 0 {
+					if nlRouteVal, ok := val.(*netlinkRoutes); ok {
+						nlRouteVal.mu.Lock()
+						if nlRouteVal.pingTimestamp.IsZero() && len(cudnpods.pods) > 0 {
 							pod := cudnpods.pods[0]
 							for range pingAttempts {
 								if err := pingAddress("", pod, exportPingerTimeoutMsec); err == nil {
@@ -509,8 +513,12 @@ func (r *raLatency) exportWorker() {
 								time.Sleep(exportWaitBeforePingRetryMsec * time.Millisecond)
 							}
 						}
-						atomic.AddUint64(&r.verifiedExportRouteCount, 1)
-						r.cudnConnTimestamp.Store(cudnpods.cudn, nlRouteVal)
+						if !nlRouteVal.pingTimestamp.IsZero() {
+							if _, loaded := r.verifiedExportRoutes.LoadOrStore(update.Dst.String(), struct{}{}); !loaded {
+								atomic.AddUint64(&r.verifiedExportRouteCount, 1)
+							}
+						}
+						nlRouteVal.mu.Unlock()
 					}
 				}
 			}
@@ -713,6 +721,7 @@ func (r *raLatency) Start(measurementWg *sync.WaitGroup) error {
 
 	// cudn pods which will be pinged during both import and export scenarios
 	r.cudnSubnet = make(map[string]cudnPods)
+	r.verifiedExportRoutes = sync.Map{}
 
 	// Maintain a list of cudn subnets and their pods, which will be used in both export and import scenarios
 	r.getPods()
@@ -806,11 +815,13 @@ func (r *raLatency) normalizeMetrics() float64 {
 			m.Latency = -1
 			val, exists := r.cudnConnTimestamp.Load(m.cudn)
 			if exists {
-				nlRouteVal := val.(netlinkRoutes)
+				nlRouteVal := val.(*netlinkRoutes)
+				nlRouteVal.mu.Lock()
 				if !nlRouteVal.pingTimestamp.IsZero() {
 					m.Latency = float64(nlRouteVal.pingTimestamp.Sub(m.Timestamp).Milliseconds())
 				}
 				m.NetlinkRouteLatency = float64(nlRouteVal.routeTimestamp.Sub(m.Timestamp).Milliseconds())
+				nlRouteVal.mu.Unlock()
 			}
 			log.Debugf("%s: acceptedLatency=%v ms latency=%v ms netlinkRouteLatency=%v ms", m.Name, m.AcceptedLatency, m.Latency, m.NetlinkRouteLatency)
 		}
