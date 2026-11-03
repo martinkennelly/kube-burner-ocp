@@ -482,7 +482,7 @@ This export go thread, reads the route (subnet), retrieves the corresponding cud
 */
 
 func (r *raLatency) exportWorker() {
-	r.wg.Done()
+	defer r.wg.Done()
 	for {
 		select {
 		case update, ok := <-r.routeCh:
@@ -515,7 +515,7 @@ func (r *raLatency) exportWorker() {
 				}
 			}
 		case <-r.exportDoneCh:
-			break
+			return
 		}
 	}
 }
